@@ -1,0 +1,266 @@
+name: terragrunt
+title: Terragrunt
+summary: Runs OpenTofu on many units of infrastructure code in dependency order, with configuration shared between them through includes and stacks.
+homepage: https://terragrunt.com/
+# Terragrunt (MIT) with the OpenTofu function code it vendors in
+# internal/vendored/opentofu (MPL-2.0) and code from Go in its ipaddr and
+# internal/vendored/compress/flate packages (BSD-3-Clause), and the Go modules
+# linked into it: MIT, Apache-2.0, BSD-3-Clause (also the Go standard library),
+# MPL-2.0 (among them HashiCorp's go-getter and HCL, SOPS, and Gruntwork's
+# boilerplate and terragrunt-engine-go), BSD-2-Clause, the Unicode data in
+# go-textseg (Unicode-DFS-2016 for v15 and Unicode-3.0 for v17), and OFL-1.1
+# for the Liberation Mono font that chroma embeds in its SVG formatter.
+# go-digest's LICENSE.docs (CC-BY-SA-4.0) and the CC-BY-4.0 terms of the MCP Go
+# SDK cover documentation, which is not compiled in. The release of each
+# version carries Terragrunt's source, and the image carries the source zips of
+# the MPL-2.0 modules.
+license: MIT AND MPL-2.0 AND Apache-2.0 AND BSD-3-Clause AND BSD-2-Clause AND Unicode-DFS-2016 AND Unicode-3.0 AND OFL-1.1
+source-release: true
+upstream:
+  source: github-release
+  repository: gruntwork-io/terragrunt
+  # Release candidates and alpha builds are published as pre-releases and do
+  # not match the pattern either.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.2.0
+  # The release assets are prebuilt binaries, checksums and signatures, with
+  # no source tarball, so the build compiles the tag.
+  git:
+    url: https://github.com/gruntwork-io/terragrunt.git
+    tag: v{version}
+    commit: 25b8bb8a7e0f19c80039356b395028cdc8755daa
+image:
+  entrypoint: [terragrunt]
+  cmd: [--help]
+  env:
+    TG_NO_AUTO_PROVIDER_CACHE_DIR: "true"
+test:
+  - |
+    terragrunt --version > version.txt
+    printf '%s\n' "terragrunt version v$VERSION" > version.want
+    cmp version.want version.txt || { echo "expected 'terragrunt version v$VERSION', got:" >&2; cat version.txt >&2; exit 1; }
+  - |
+    # hcl fmt --check fails on a file that needs formatting, and hcl fmt
+    # rewrites it.
+    mkdir -p fmt/unit
+    printf '%s\n' 'locals {' 'env="dev"' '  region =   "eu-west-1"' '}' > fmt/unit/terragrunt.hcl
+    cd fmt || exit 1
+    if terragrunt hcl fmt --check > check.txt 2>&1; then
+      cat check.txt >&2; echo "hcl fmt --check passed on an unformatted file" >&2; exit 1
+    fi
+    grep -Fq 'needs formatting' check.txt || { cat check.txt >&2; exit 1; }
+    terragrunt hcl fmt > fmt.txt 2>&1 || { cat fmt.txt >&2; exit 1; }
+    printf '%s\n' 'locals {' '  env    = "dev"' '  region = "eu-west-1"' '}' > fmt.want
+    cmp fmt.want unit/terragrunt.hcl || { cat unit/terragrunt.hcl >&2; exit 1; }
+    terragrunt hcl fmt --check > check.txt 2>&1 || { cat check.txt >&2; exit 1; }
+  - |
+    # Discovery reads the dependency blocks: app depends on vpc, so vpc comes
+    # first in the run order although app sorts first by name.
+    mkdir -p live/vpc live/app
+    : > live/vpc/terragrunt.hcl
+    cat > live/app/terragrunt.hcl <<'EOF'
+    dependency "vpc" {
+      config_path = "../vpc"
+
+      mock_outputs = {
+        cidr = "10.0.0.0/16"
+      }
+    }
+
+    inputs = {
+      cidr = dependency.vpc.outputs.cidr
+    }
+    EOF
+    cd live || exit 1
+    terragrunt find --dag --format=json > find.json 2> find.err || { cat find.err >&2; exit 1; }
+    printf '%s\n' '[' '  {' '    "type": "unit",' '    "path": "vpc"' '  },' '  {' '    "type": "unit",' '    "path": "app"' '  }' ']' > find.want
+    cmp find.want find.json || { cat find.json >&2; exit 1; }
+    terragrunt dag graph > graph.dot 2> graph.err || { cat graph.err >&2; exit 1; }
+    grep -Fq '"app" -> "vpc";' graph.dot || { cat graph.dot >&2; exit 1; }
+  - |
+    # render merges the included root.hcl and evaluates the functions.
+    # cidrsubnet, cidrcontains, base64gzip, base64gunzip and urldecode come
+    # from the OpenTofu code that Terragrunt vendors, and the CIDR functions
+    # use the code from Go's net package in its ipaddr package.
+    mkdir -p render/app
+    cat > render/root.hcl <<'EOF'
+    locals {
+      project = "rc"
+    }
+
+    inputs = {
+      project = local.project
+    }
+    EOF
+    cat > render/app/terragrunt.hcl <<'EOF'
+    include "root" {
+      path   = find_in_parent_folders("root.hcl")
+      expose = true
+    }
+
+    inputs = {
+      name      = upper(format("%s-%s", include.root.locals.project, basename(get_terragrunt_dir())))
+      subnet    = cidrsubnet("10.1.0.0/16", 8, 2)
+      inside    = cidrcontains("10.1.0.0/16", "10.1.2.3")
+      roundtrip = base64gunzip(base64gzip("hello"))
+      query     = urldecode("a%20b")
+    }
+    EOF
+    cd render/app || exit 1
+    terragrunt render --format=json > render.json 2> render.err || { cat render.err >&2; exit 1; }
+    for want in '"project":"rc"' '"name":"RC-APP"' '"subnet":"10.1.2.0/24"' \
+      '"inside":true' '"roundtrip":"hello"' '"query":"a b"'; do
+      grep -Fq "$want" render.json || { cat render.json >&2; echo "missing $want" >&2; exit 1; }
+    done
+  - |
+    # stack generate copies the unit into .terragrunt-stack and writes its
+    # values next to it.
+    mkdir -p stack/units/greet stack/live
+    printf '%s\n' 'inputs = {' '  who = values.who' '}' > stack/units/greet/terragrunt.hcl
+    cat > stack/live/terragrunt.stack.hcl <<'EOF'
+    unit "greet" {
+      source = "../units/greet"
+      path   = "greet"
+
+      values = {
+        who = "stack"
+      }
+    }
+    EOF
+    cd stack/live || exit 1
+    terragrunt stack generate > generate.txt 2>&1 || { cat generate.txt >&2; exit 1; }
+    for f in terragrunt.hcl terragrunt.values.hcl; do
+      test -s ".terragrunt-stack/greet/$f" || { cat generate.txt >&2; echo "stack generate wrote no $f" >&2; exit 1; }
+    done
+    cd .terragrunt-stack/greet || exit 1
+    terragrunt render --format=json > render.json 2> render.err || { cat render.err >&2; exit 1; }
+    grep -Fq '"inputs":{"who":"stack"}' render.json || { cat render.json >&2; exit 1; }
+  - |
+    # run probes tofu -version, runs init because the unit has not been
+    # initialized, then the command, with the inputs as TF_VAR_ variables.
+    # A stand-in tofu records the calls, so this needs no OpenTofu.
+    mkdir -p run/bin run/unit
+    cd run || exit 1
+    cat > bin/tofu <<EOF
+    #!/bin/sh
+    if [ "\$1" = -version ]; then
+      echo 'OpenTofu v1.13.2'
+      echo 'on linux_amd64'
+      exit 0
+    fi
+    printf '%s name=%s\n' "\$1" "\${TF_VAR_name-}" >> '$PWD/calls.txt'
+    EOF
+    chmod +x bin/tofu
+    printf '%s\n' 'variable "name" {' '  type = string' '}' > unit/main.tf
+    printf '%s\n' 'inputs = {' '  name = "rc"' '}' > unit/terragrunt.hcl
+    bin=$PWD/bin
+    cd unit || exit 1
+    PATH="$bin:$PATH" terragrunt run --non-interactive -- plan > ../plan.txt 2>&1 || { cat ../plan.txt >&2; exit 1; }
+    cd .. || exit 1
+    grep -q '^init ' calls.txt || { cat plan.txt calls.txt >&2; echo "no tofu init" >&2; exit 1; }
+    tail -n 1 calls.txt > last.txt
+    printf '%s\n' 'plan name=rc' > last.want
+    cmp last.want last.txt || { cat plan.txt calls.txt >&2; exit 1; }
+examples:
+  - title: List the units below the current directory in the order they run
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/terragrunt find --dag
+  - title: Plan every unit below the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/terragrunt run --all -- plan
+  - title: Check the formatting of every HCL file below the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/terragrunt hcl fmt --check
+  - title: Generate the units of the stack in the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/terragrunt stack generate
+combos:
+  - with: [opentofu, openssh-client]
+    default: true
+    base: terragrunt
+    summary: Terragrunt with OpenTofu, Git and the OpenSSH client, for units whose modules come from the OpenTofu registry or from Git repositories over HTTPS or SSH.
+    extras:
+      alpine: {packages: [git]}
+      ubuntu: {packages: [git]}
+    extras-license: GPL-2.0-only
+    test:
+      - |
+        # run --all applies vpc before app and passes vpc's output to app
+        # through the dependency block. terraform_data belongs to OpenTofu's
+        # built-in provider, so nothing is downloaded.
+        mkdir -p all/vpc all/app
+        cat > all/vpc/main.tf <<'EOF'
+        resource "terraform_data" "net" {
+          input = "10.1.2.0/24"
+        }
+
+        output "cidr" {
+          value = terraform_data.net.output
+        }
+        EOF
+        : > all/vpc/terragrunt.hcl
+        cat > all/app/main.tf <<'EOF'
+        variable "cidr" {
+          type = string
+        }
+
+        resource "terraform_data" "app" {
+          input = "app in ${var.cidr}"
+        }
+
+        output "greeting" {
+          value = terraform_data.app.output
+        }
+        EOF
+        printf '%s\n' 'dependency "vpc" {' '  config_path = "../vpc"' '}' '' \
+          'inputs = {' '  cidr = dependency.vpc.outputs.cidr' '}' > all/app/terragrunt.hcl
+        cd all || exit 1
+        terragrunt run --all --non-interactive -- apply > apply.txt 2>&1 || { cat apply.txt >&2; exit 1; }
+        cd app || exit 1
+        terragrunt run --non-interactive -- output -raw greeting > ../greeting.txt 2> ../output.err \
+          || { cat ../output.err >&2; exit 1; }
+        printf 'app in 10.1.2.0/24' > ../greeting.want
+        cmp ../greeting.want ../greeting.txt || { cat ../greeting.txt ../output.err >&2; exit 1; }
+        # The image turns Terragrunt's automatic provider cache off. Turned
+        # back on, the cache goes to /cache/terragrunt/providers.
+        test ! -e /cache/terragrunt/providers \
+          || { cat ../apply.txt >&2; echo "run created /cache/terragrunt/providers" >&2; exit 1; }
+        TG_NO_AUTO_PROVIDER_CACHE_DIR=false terragrunt run --non-interactive -- plan > ../plan.txt 2>&1 \
+          || { cat ../plan.txt >&2; exit 1; }
+        test -d /cache/terragrunt/providers || { cat ../plan.txt >&2; echo "no /cache/terragrunt/providers" >&2; exit 1; }
+      - |
+        # A unit whose module comes from a tag in a local Git repository.
+        mkdir -p git/mods git/unit
+        cd git || exit 1
+        cat > mods/main.tf <<'EOF'
+        variable "who" {
+          type = string
+        }
+
+        output "text" {
+          value = "hello ${var.who} from git"
+        }
+        EOF
+        git -c init.defaultBranch=main init -q mods
+        git -C mods add main.tf
+        git -C mods -c user.name=test -c user.email=test@example.invalid commit -q -m 'Add the module'
+        git -C mods tag v1
+        printf '%s\n' 'terraform {' "  source = \"git::file://$PWD/mods?ref=v1\"" '}' '' \
+          'inputs = {' '  who = "world"' '}' > unit/terragrunt.hcl
+        cd unit || exit 1
+        terragrunt run --non-interactive -- apply -auto-approve > ../apply.txt 2>&1 || { cat ../apply.txt >&2; exit 1; }
+        terragrunt run --non-interactive -- output -raw text > ../text.txt 2> ../output.err \
+          || { cat ../output.err >&2; exit 1; }
+        printf 'hello world from git' > ../text.want
+        cmp ../text.want ../text.txt || { cat ../text.txt ../output.err >&2; exit 1; }
+      - |
+        # Git runs ssh from PATH, the OpenSSH client's wrapper, which works for
+        # a UID without a passwd entry. Nothing listens on port 9.
+        command -v ssh > ssh-path.txt
+        printf '%s\n' /usr/local/bin/ssh > ssh-path.want
+        cmp ssh-path.want ssh-path.txt || { cat ssh-path.txt >&2; exit 1; }
+        mkdir ssh
+        printf '%s\n' 'terraform {' '  source = "git::ssh://git@127.0.0.1:9/mods.git?ref=v1"' '}' > ssh/terragrunt.hcl
+        cd ssh || exit 1
+        if terragrunt run --non-interactive -- plan > ../ssh.txt 2>&1; then
+          cat ../ssh.txt >&2; echo "a module from an unreachable SSH remote was downloaded" >&2; exit 1
+        fi
+        grep -Fq 'port 9: Connection refused' ../ssh.txt || { cat ../ssh.txt >&2; exit 1; }
