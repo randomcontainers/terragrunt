@@ -24,13 +24,13 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 1.2.2
+  version: 1.2.3
   # The release assets are prebuilt binaries, checksums and signatures, with
   # no source tarball, so the build compiles the tag.
   git:
     url: https://github.com/gruntwork-io/terragrunt.git
     tag: v{version}
-    commit: 109a529eca372cc90fe05c47d2b14a33aa196ac0
+    commit: e9fae69cc91f50200fecad7bce425e9d11e9e279
 image:
   entrypoint: [terragrunt]
   cmd: [--help]
